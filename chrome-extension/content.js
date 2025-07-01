@@ -18,8 +18,49 @@ class JobFlowContentScript {
             }
         });
         
+        // Listen for message from background to fill job application
+        chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+            if (message.action === 'fillJobApplication') {
+                this.automateAshbyApplication();
+                sendResponse({ success: true });
+            }
+        });
+        
         // Detect if we're on a job application page
         this.detectJobPlatform();
+        
+        // Listen for form submission to notify background script
+        window.addEventListener('submit', function(e) {
+            if (e.target && e.target.matches('form')) {
+                chrome.runtime.sendMessage({ action: 'jobSubmitted' });
+            }
+        }, true);
+
+        console.log('[JobFlow Extension] Content script loaded');
+
+        // Listen for messages from the web page
+        window.addEventListener("message", function(event) {
+            if (event.data && event.data.type === "JOBFLOW_PING") {
+                console.log('[JobFlow Extension] Received JOBFLOW_PING from web app');
+                window.postMessage({ type: "JOBFLOW_PONG" }, "*");
+                console.log('[JobFlow Extension] Sent JOBFLOW_PONG to web app');
+            }
+            if (event.data && event.data.type === "JOBFLOW_START_APPLYING") {
+                console.log('[JobFlow Extension] Received JOBFLOW_START_APPLYING with jobs:', event.data.jobs);
+                chrome.storage.local.set({ selectedJobs: event.data.jobs }, () => {
+                    console.log('[JobFlow Extension] Saved selected jobs to storage');
+                });
+                chrome.runtime.sendMessage({
+                    action: "startApplying",
+                    jobs: event.data.jobs
+                });
+            }
+            // Listen for session ID transfer
+            if (event.data && event.data.type === "JOBFLOW_SESSION_ID") {
+                chrome.storage.local.set({ sessionId: event.data.sessionId });
+                console.log('[JobFlow Extension] Session ID received and saved:', event.data.sessionId);
+            }
+        });
     }
     
     detectJobPlatform() {
@@ -124,19 +165,27 @@ class JobFlowContentScript {
     }
     
     async fillAshbyForm() {
-        // Fill out common form fields
-        await this.fillCommonFields();
-        
-        // Ashby-specific fields
+        // Load user profile from storage
+        let profile = null;
+        try {
+            const result = await chrome.storage.local.get('userProfile');
+            profile = result.userProfile;
+            if (profile) {
+                console.log('[JobFlow Extension] Using real user profile for form filling:', profile);
+            } else {
+                console.log('[JobFlow Extension] No user profile found, using dummy data.');
+            }
+        } catch (e) {
+            console.log('[JobFlow Extension] Error loading user profile, using dummy data.');
+        }
+        // Use real info if available, else fallback
         const fields = {
-            'input[name="firstName"]': 'John',
-            'input[name="lastName"]': 'Doe',
-            'input[name="email"]': 'john.doe@example.com',
-            'input[name="phone"]': '+1234567890',
-            'textarea[name="coverLetter"]': this.generateCoverLetter(),
-            'input[name="resume"]': this.getResumeFile()
+            'input[name="firstName"]': profile?.full_name?.split(' ')[0] || 'John',
+            'input[name="lastName"]': profile?.full_name?.split(' ').slice(1).join(' ') || 'Doe',
+            'input[name="email"]': profile?.email || 'john.doe@example.com',
+            'input[name="phone"]': profile?.phone || '+1234567890',
+            'textarea[name="coverLetter"]': 'I am excited to apply for this role!',
         };
-        
         for (const [selector, value] of Object.entries(fields)) {
             await this.fillField(selector, value);
         }
@@ -312,6 +361,30 @@ John Doe`;
         } catch (error) {
             console.error('JobFlow: Error updating job status:', error);
         }
+    }
+    
+    async automateAshbyApplication() {
+        if (this.platform !== 'ashby') {
+            console.log('[JobFlow Extension] Not an Ashby job page, skipping automation.');
+            return;
+        }
+        console.log('[JobFlow Extension] Starting Ashby automation...');
+        // Try to click the Apply button if present
+        const applyBtn = document.querySelector('button, a[href*="apply"], a[data-testid*="apply"]');
+        if (applyBtn) {
+            console.log('[JobFlow Extension] Clicking Apply button...');
+            applyBtn.click();
+            await new Promise(r => setTimeout(r, 1500)); // Wait for form to appear
+        } else {
+            console.log('[JobFlow Extension] No Apply button found, assuming form is visible.');
+        }
+        // Wait for the Ashby application form
+        await this.waitForElement('form[data-testid="application-form"]', 10000);
+        console.log('[JobFlow Extension] Ashby form detected, filling fields...');
+        // Fill the form with dummy data
+        await this.fillAshbyForm();
+        // Do NOT auto-submit; user must click submit
+        console.log('[JobFlow Extension] Form filled. Waiting for user to submit...');
     }
 }
 

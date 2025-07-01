@@ -234,74 +234,36 @@
             <h1>JobFlow Auto Apply</h1>
             <p class="subtitle">Automated job applications</p>
         </div>
-        
-        <!-- Connection Section -->
-        <div class="section">
-            <div class="section-title">
-                <span>🔗</span>
-                Connection
-            </div>
-            
-            <div id="status-disconnected" class="status disconnected">
-                <strong>Not Connected</strong><br>
-                Enter your Session ID to connect
-            </div>
-            
-            <div id="status-connected" class="status connected hidden">
-                <strong>Connected</strong><br>
-                Ready to apply to jobs
-            </div>
-            
-            <div id="status-loading" class="status loading hidden">
-                <span class="spinner"></span>
-                <strong>Connecting...</strong>
-            </div>
-            
-            <div class="input-group">
-                <label for="sessionId">Session ID</label>
-                <input type="text" id="sessionId" placeholder="Paste your Session ID here">
-            </div>
-            
-            <button id="connectBtn" class="btn btn-primary">Connect</button>
-            <button id="disconnectBtn" class="btn btn-secondary hidden">Disconnect</button>
-        </div>
-        
         <!-- Jobs Section -->
         <div class="section">
             <div class="section-title">
                 <span>💼</span>
                 Selected Jobs
             </div>
-            
             <div id="noJobs" class="job-list">
                 <div style="text-align: center; opacity: 0.7; padding: 20px;">
                     No jobs loaded<br>
-                    Connect to see your selected jobs
+                    Open the web app and select jobs to get started
                 </div>
             </div>
-            
             <div id="jobsList" class="job-list hidden">
                 <!-- Jobs will be populated here -->
             </div>
         </div>
-        
         <!-- Actions Section -->
         <div class="section">
             <div class="section-title">
                 <span>⚡</span>
                 Actions
             </div>
-            
             <button id="startApplyingBtn" class="btn btn-primary" disabled>
                 Start Applying
             </button>
-            
             <button id="stopApplyingBtn" class="btn btn-secondary hidden">
                 Stop Applying
             </button>
         </div>
     </div>
-    
     <script src="popup.js"></script>
 </body>
 </html> 

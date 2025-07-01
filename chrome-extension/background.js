@@ -1,5 +1,8 @@
 // Background service worker for JobFlow Chrome Extension
 
+// Set backend URL (change here if needed)
+const BACKEND_URL = 'http://localhost:8000';
+
 // Handle extension installation
 chrome.runtime.onInstalled.addListener((details) => {
     if (details.reason === 'install') {
@@ -17,23 +20,30 @@ chrome.runtime.onInstalled.addListener((details) => {
 // Handle messages from content scripts and popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log('JobFlow: Background received message:', message);
-    
+    let asyncHandled = false;
     switch (message.action) {
         case 'jobApplied':
-            handleJobApplied(message);
+            handleJobApplied(message).then(() => sendResponse({ success: true })).catch(e => sendResponse({ success: false, error: e.message }));
+            asyncHandled = true;
             break;
         case 'getJobs':
             handleGetJobs(sendResponse);
+            asyncHandled = true;
             break;
         case 'updateJobStatus':
-            handleUpdateJobStatus(message);
+            handleUpdateJobStatus(message).then(() => sendResponse({ success: true })).catch(e => sendResponse({ success: false, error: e.message }));
+            asyncHandled = true;
+            break;
+        case 'startJobAutomation':
+            automateJobs(message.jobs).then(() => sendResponse({ success: true })).catch(e => sendResponse({ success: false, error: e.message }));
+            asyncHandled = true;
             break;
         default:
             console.log('JobFlow: Unknown message action:', message.action);
+            sendResponse({ success: false, error: 'Unknown action' });
     }
-    
-    // Return true to indicate we'll send a response asynchronously
-    return true;
+    // Return true if we handled async
+    return asyncHandled;
 });
 
 // Handle job application completion
@@ -47,7 +57,7 @@ async function handleJobApplied(message) {
         
         if (sessionId) {
             // Update status in backend
-            const response = await fetch(`http://localhost:8000/chrome-extension/update-status/${sessionId}`, {
+            const response = await fetch(`${BACKEND_URL}/chrome-extension/update-status/${sessionId}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -76,7 +86,7 @@ async function handleGetJobs(sendResponse) {
         const sessionId = result.sessionId;
         
         if (sessionId) {
-            const response = await fetch(`http://localhost:8000/chrome-extension/jobs/${sessionId}`);
+            const response = await fetch(`${BACKEND_URL}/chrome-extension/jobs/${sessionId}`);
             
             if (response.ok) {
                 const data = await response.json();
@@ -162,6 +172,8 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
             const newSessionId = changes.sessionId.newValue;
             if (newSessionId) {
                 console.log('JobFlow: New session ID set:', newSessionId);
+                // Fetch user profile from backend
+                fetchUserProfile();
             } else {
                 console.log('JobFlow: Session ID cleared');
             }
@@ -214,4 +226,76 @@ if (typeof module !== 'undefined' && module.exports) {
         handleGetJobs,
         handleUpdateJobStatus
     };
+}
+
+async function automateJobs(jobs) {
+    for (const job of jobs) {
+        // Open job link in a new tab
+        const tab = await chrome.tabs.create({ url: job.link, active: true });
+        // Wait for the tab to finish loading
+        await waitForTabLoad(tab.id);
+        // Send candidate info to content script
+        await chrome.tabs.sendMessage(tab.id, {
+            action: 'fillJobApplication',
+            candidateInfo: job.candidateInfo
+        });
+        // Notify user that the job is ready for review
+        chrome.notifications.create({
+            type: 'basic',
+            iconUrl: 'icons/icon48.png',
+            title: 'JobFlow: Review Application',
+            message: 'Please review and submit your application for this job.'
+        });
+        // Wait for the user to submit (content script can send a message back when done)
+        await waitForUserSubmission(tab.id);
+        // Leave the tab open and move to the next job
+    }
+}
+
+function waitForTabLoad(tabId) {
+    return new Promise((resolve) => {
+        function checkTab() {
+            chrome.tabs.get(tabId, (tab) => {
+                if (tab.status === 'complete') {
+                    resolve();
+                } else {
+                    setTimeout(checkTab, 500);
+                }
+            });
+        }
+        checkTab();
+    });
+}
+
+function waitForUserSubmission(tabId) {
+    return new Promise((resolve) => {
+        function onMessage(message, sender) {
+            if (sender.tab && sender.tab.id === tabId && message.action === 'jobSubmitted') {
+                chrome.runtime.onMessage.removeListener(onMessage);
+                resolve();
+            }
+        }
+        chrome.runtime.onMessage.addListener(onMessage);
+    });
+}
+
+async function fetchUserProfile() {
+    try {
+        // Get token from storage if needed, or use session
+        const result = await chrome.storage.local.get('sessionId');
+        const sessionId = result.sessionId;
+        // Assume token is not needed for /profile (if needed, add logic)
+        const response = await fetch(`${BACKEND_URL}/profile`, {
+            credentials: 'include'
+        });
+        if (response.ok) {
+            const profile = await response.json();
+            await chrome.storage.local.set({ userProfile: profile });
+            console.log('JobFlow: User profile fetched and saved:', profile);
+        } else {
+            console.error('JobFlow: Failed to fetch user profile');
+        }
+    } catch (error) {
+        console.error('JobFlow: Error fetching user profile:', error);
+    }
 } 

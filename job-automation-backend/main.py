@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Query, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, status, Query, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Job, Base
 import models
-from schemas import UserCreate, UserLogin, UserResponse, Token, UserUpdate, JobResult
+from schemas import UserCreate, UserLogin, UserResponse, Token, UserUpdate, JobResult, ProfileCreate, ProfileUpdate, ProfileResponse
 from auth import get_password_hash, verify_password, create_access_token, decode_access_token
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 import requests
@@ -23,34 +23,32 @@ import os
 import shutil
 import tempfile
 from fastapi.staticfiles import StaticFiles
-from llama_cpp import Llama
 import json as pyjson
 from pdfminer.high_level import extract_text as extract_pdf_text
 import docx
 import uuid
+from models import Profile
+import torch
+from contextlib import redirect_stdout, redirect_stderr
+import io
 
-# Add GPU detection
-try:
-    import torch
-    CUDA_AVAILABLE = torch.cuda.is_available()
-    if CUDA_AVAILABLE:
-        print(f"[GPU] CUDA is available! Found {torch.cuda.device_count()} GPU(s)")
-        for i in range(torch.cuda.device_count()):
-            print(f"[GPU] GPU {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print("[GPU] CUDA is not available, will use CPU")
-except ImportError:
-    print("[GPU] PyTorch not installed, cannot detect CUDA")
-    CUDA_AVAILABLE = False
+# Import configuration (this will configure logging automatically)
+import config
+
+# Always enable LLM debug output
+config.DEBUG_LLM = True
 
 app = FastAPI()
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "chrome-extension://jfcimmieenbgbchfgmogceflafddmkpk"
+    ],
     allow_credentials=True,
-    allow_methods=["*"] ,
+    allow_methods=["*"],
     allow_headers=["*"] ,
 )
 
@@ -70,13 +68,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     try:
         payload = decode_access_token(token)
         if payload is None or "sub" not in payload:
-            return None
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
         user = db.query(models.User).filter(models.User.email == payload["sub"]).first()
         if user is None:
-            return None
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         return user
     except Exception:
-        return None
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
 @app.post("/register", response_model=UserResponse)
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -86,7 +84,6 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     hashed_password = get_password_hash(user.password)
     new_user = models.User(
         email=user.email, 
-        full_name=user.full_name, 
         hashed_password=hashed_password
     )  # type: ignore
     db.add(new_user)
@@ -96,6 +93,8 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/login", response_model=Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    print(f"[LOGIN DEBUG] Received username: {form_data.username}")
+    print(f"[LOGIN DEBUG] Received password: {form_data.password}")
     user = db.query(models.User).filter(models.User.email == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -108,19 +107,18 @@ def read_me(current_user: models.User = Depends(get_current_user)):
 
 @app.get("/profile", response_model=UserResponse)
 def get_profile(current_user: models.User = Depends(get_current_user)):
-    return UserResponse.from_orm(current_user)
+    return current_user
 
 @app.put("/profile", response_model=UserResponse)
 def update_profile(update: UserUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    if update.full_name is not None:
-        current_user.full_name = update.full_name
-    if update.location is not None:
-        current_user.location = update.location
-    if update.visa_status is not None:
-        current_user.visa_status = update.visa_status
+    # Only allow updating email and password for User model
+    if update.email is not None:
+        setattr(current_user, 'email', update.email)
+    if update.password is not None:
+        setattr(current_user, 'hashed_password', get_password_hash(update.password))
     db.commit()
     db.refresh(current_user)
-    return UserResponse.from_orm(current_user)
+    return current_user
 
 @app.get("/")
 def read_root():
@@ -235,15 +233,51 @@ def search_jobs(title: str, db: Session = Depends(get_db)):
     jobs = query.order_by(Job.fetched_at.desc()).limit(50).all()
     return [
         JobResult(
-            title=job.title,
-            company=job.company,
-            location=job.location,
-            description=job.description or "",
-            link=job.link,
+            title=str(job.title),
+            company=str(job.company),
+            location=str(job.location),
+            description=str(job.description or ""),
+            link=str(job.link),
             source=getattr(job, 'source', None)
         )
         for job in jobs
     ]
+
+@app.get("/search_database", response_model=List[JobResult])
+def search_database_only(title: str, location: str = "", limit: int = 50):
+    """
+    Fast database-only search (no live scraping)
+    Returns jobs from the cached database only
+    """
+    session = SessionLocal()
+    try:
+        query = session.query(Job)
+        if title:
+            query = query.filter(Job.title.ilike(f"%{title}%"))
+        if location:
+            query = query.filter(Job.location.ilike(f"%{location}%"))
+        db_jobs = query.order_by(Job.fetched_at.desc()).limit(limit).all()
+        
+        results = []
+        for job in db_jobs:
+            results.append(JobResult(
+                id=job.id,
+                title=str(job.title),
+                company=str(job.company),
+                location=str(job.location),
+                description=str(job.description or ""),
+                link=str(job.link),
+                source=str(job.source)
+            ))
+        
+        print(f"[Search] Database-only search returned {len(results)} jobs")
+        return results
+        
+    except Exception as e:
+        print(f"[Search] Database error: {e}")
+        return []
+    finally:
+        session.close()
 
 @app.get("/search_all", response_model=List[JobResult])
 def search_all_jobs(title: str, location: str = "", limit: int = 50):
@@ -283,6 +317,7 @@ def search_all_jobs(title: str, location: str = "", limit: int = 50):
         ashby_jobs = fetch_ashby_jobs("openai")  # Test with OpenAI
         for job in ashby_jobs[:limit//6]:
             all_jobs.append(JobResult(
+                id=job.get("id", 0),
                 title=job.get("title", ""),
                 company=job.get("company", ""),
                 location=job.get("location", ""),
@@ -295,6 +330,7 @@ def search_all_jobs(title: str, location: str = "", limit: int = 50):
         greenhouse_jobs = fetch_greenhouse_jobs("stripe", title)
         for job in greenhouse_jobs[:limit//6]:
             all_jobs.append(JobResult(
+                id=job.get("id", 0),
                 title=job.get("title", ""),
                 company=job.get("company", ""),
                 location=job.get("location", ""),
@@ -675,278 +711,479 @@ def fetch_lever_jobs(company: str, title: str) -> list:
         return jobs
     except Exception as e:
         print(f"[Lever Debug] Exception in fetch_lever_jobs for {company}: {e}")
-    return []
-
-def fetch_rippling_jobs(company: str, title: str) -> list:
-    """Fetch jobs from Rippling for a specific company."""
-    jobs = []
-    try:
-        url = f"https://ats.rippling.com/{company}/jobs"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; JobBot/1.0)"}
-        resp = requests.get(url, headers=headers, timeout=30)
-        if resp.status_code != 200:
-            return []
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # Find job postings with improved selectors - only real job postings
-        job_elements = []
-        
-        # More specific selectors for real job listings
-        selectors = [
-            'a[href*="/jobs/"]',  # Links containing /jobs/
-            '.job-card', '.job-listing', '.position-card',  # Common job card classes
-            '[data-job-id]',  # Elements with job ID data attribute
-            'div[class*="job"]', 'div[class*="position"]',  # Divs with job-related classes
-        ]
-        
-        for selector in selectors:
-            elements = soup.select(selector)
-            if elements:
-                job_elements.extend(elements)
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_job_elements = []
-        for elem in job_elements:
-            elem_id = elem.get('href', '') or elem.get('data-job-id', '') or str(elem)
-            if elem_id not in seen:
-                seen.add(elem_id)
-                unique_job_elements.append(elem)
-        
-        for job_elem in unique_job_elements:
-            try:
-                # Extract job title - look for headers or title elements
-                job_title = ""
-                title_selectors = [
-                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',  # Headers
-                    '[class*="title"]', '[class*="job-title"]',  # Title classes
-                    '.job-title', '.position-title',  # Specific title classes
-                ]
-                
-                for selector in title_selectors:
-                    title_elem = job_elem.select_one(selector)
-                    if title_elem:
-                        job_title = title_elem.get_text(strip=True)
-                        if job_title and job_title.lower() != "apply":
-                            break
-                
-                # If no title found, try getting text from the element itself
-                if not job_title or job_title.lower() == "apply":
-                    job_title = job_elem.get_text(strip=True)
-                    # Clean up the title (remove extra whitespace, newlines)
-                    job_title = re.sub(r'\s+', ' ', job_title).strip()
-                    # Skip if it's just "Apply" or similar
-                    if job_title.lower() in ["apply", "apply now", "apply for this job"]:
-                        continue
-                
-                # Skip if not a real job title
-                if not job_title or len(job_title) < 3:
-                    continue
-                
-                # Extract location
-                location = ""
-                location_selectors = [
-                    '[class*="location"]', '[class*="place"]', '[class*="city"]',
-                    '.location', '.job-location', '.position-location'
-                ]
-                
-                for selector in location_selectors:
-                    location_elem = job_elem.select_one(selector)
-                    if location_elem:
-                        location = location_elem.get_text(strip=True)
-                        if location:
-                            break
-                
-                # Get job link
-                job_link = ""
-                if job_elem.name == 'a':
-                    job_link = job_elem.get('href', '')
-                else:
-                    link_elem = job_elem.find('a', href=True)
-                    if link_elem:
-                        job_link = link_elem.get('href', '')
-                
-                if job_link and not job_link.startswith('http'):
-                    job_link = f"https://ats.rippling.com{job_link}"
-                
-                # Skip if no valid link
-                if not job_link or '/jobs/' not in job_link:
-                    continue
-                
-                # Fetch description (first 3 lines only)
-                description = None
-                try:
-                    detail_resp = requests.get(job_link, headers=headers, timeout=10)
-                    if detail_resp.status_code == 200:
-                        detail_soup = BeautifulSoup(detail_resp.text, 'html.parser')
-                        
-                        # Extract description (first 3 lines only)
-                        desc_elem = detail_soup.find('div', class_=re.compile(r'description|job-description|posting-description', re.I))
-                        if desc_elem:
-                            desc_text = desc_elem.get_text(separator=' ', strip=True)
-                            # Get first 3 sentences only
-                            sentences = re.split(r'[.!?]+', desc_text)
-                            description = '. '.join(sentences[:3]).strip() + ('...' if len(sentences) > 3 else '')
-                        else:
-                            # Fallback: first paragraph
-                            p_elem = detail_soup.find('p')
-                            if p_elem:
-                                desc_text = p_elem.get_text(separator=' ', strip=True)
-                                sentences = re.split(r'[.!?]+', desc_text)
-                                description = '. '.join(sentences[:3]).strip() + ('...' if len(sentences) > 3 else '')
-                
-                except Exception as e:
-                    pass
-                
-                # Filter by title if provided
-                def normalize(s):
-                    return re.sub(r'[^a-z0-9 ]', '', s.lower())
-                if title and normalize(title) not in normalize(job_title):
-                    continue
-                
-                jobs.append({
-                    "title": job_title,
-                    "company": company.title(),
-                    "location": location,
-                    "description": description,
-                    "link": job_link,
-                })
-            except Exception as e:
-                continue
-        
-        if company == "momentumcareers":
-            print(f"[Rippling Debug] Found {len(jobs)} jobs for momentumcareers")
-        return jobs
-    except Exception as e:
-        pass
     return [] 
 
-@app.post("/upload_resume_llm", response_model=UserResponse)
-def upload_resume_llm(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    # Check if filename exists
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
+@app.post("/upload_resume_llm", response_model=ProfileResponse)
+def upload_resume_llm(file: UploadFile = File(...), title: str = Query(None, description="Profile title"), db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """
+    Upload and parse resume using LLM with split extraction approach
+    """
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
     
-    # Save uploaded file to a temp location
-    with tempfile.NamedTemporaryFile(delete=False, suffix="." + file.filename.split(".")[-1]) as tmp:
-        tmp.write(file.file.read())
-        tmp_path = tmp.name
+    # Validate file type
+    allowed_extensions = {'.pdf', '.doc', '.docx'}
+    file_extension = os.path.splitext(file.filename)[1].lower()
+    if file_extension not in allowed_extensions:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}")
     
-    # Extract raw text
-    resume_text = extract_text_from_file(tmp_path)
+    # Create temporary file
+    tmp_path = None
     try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
-    
-    # Prepare LLM prompt (shorter and more focused)
-    prompt = f"""Extract from this resume and return as valid JSON:
-- name
-- phone
-- location
-- work_experience (array of objects with title, company, dates)
-- education (array of objects with degree, school, year - degree is required)
-- skills (array of strings)
-- languages (array of strings)
-
-Resume: {resume_text[:2000]}
-JSON:"""
-    
-    # Log the prompt being sent to LLM
-    print("\n" + "="*80)
-    print("🤖 LLM PROMPT BEING SENT:")
-    print("="*80)
-    print(prompt)
-    print("="*80)
-    print("🤖 END OF PROMPT")
-    print("="*80)
-    
-    # Use the Mistral model
-    model_path = "./models/mistral-7b-instruct-v0.2.Q5_K_M.gguf"
-    print(f"[DEBUG] Attempting to load Mistral model from: {model_path}")
-    
-    try:
-        print("[DEBUG] About to instantiate Llama with CPU optimization...")
+        # Create a temporary file with the correct extension
+        suffix = file_extension
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_path = tmp_file.name
+            # Write uploaded file content to temporary file
+            content = file.file.read()
+            tmp_file.write(content)
+            tmp_file.flush()
         
-        # Configure for CPU usage with smaller context
-        llm = Llama(
-            model_path=model_path, 
-            n_gpu_layers=0,  # Use CPU only
-            n_ctx=2048,  # Smaller context window
-            verbose=False
-        )
-        print("[DEBUG] Mistral model instantiated successfully")
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] Temporary file created: {tmp_path}")
+            print(f"[DEBUG] File size: {len(content)} bytes")
         
-        print("[DEBUG] About to call llm() for generation...")
-        result = llm(prompt, max_tokens=1500, stop=["\nJSON:"])
+        # Extract text from the file
+        resume_text = extract_text_from_file(tmp_path)
         
-        # Handle the response based on the actual structure
-        if hasattr(result, 'choices') and result.choices:
-            output = result.choices[0].text
-        elif hasattr(result, 'text'):
-            output = result.text
-        elif isinstance(result, dict) and 'choices' in result:
-            output = result['choices'][0]['text']
-        else:
-            output = str(result)
-        print(f"[DEBUG] Model generation output received: {output[:500]}...")
+        if not resume_text or len(resume_text.strip()) < 50:
+            raise HTTPException(status_code=400, detail="Could not extract meaningful text from the uploaded file. Please ensure the file contains readable text.")
         
-        # Try to extract JSON from output
-        try:
-            json_start = output.find('{')
-            json_end = output.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                profile_json = pyjson.loads(output[json_start:json_end])
-            else:
-                print("[DEBUG] LLM did not return valid JSON format.")
-                raise HTTPException(status_code=500, detail="LLM did not return valid JSON format.")
-        except pyjson.JSONDecodeError as e:
-            print(f"[DEBUG] LLM did not return valid JSON (JSONDecodeError): {e}. Output was: {output}")
-            raise HTTPException(status_code=500, detail="LLM did not return valid JSON.")
-        
-        # Update user profile fields with extracted data
-        if profile_json.get("name"):
-            current_user.full_name = profile_json["name"]
-        # Don't update email as it's used for authentication
-        # if profile_json.get("email"):
-        #     current_user.email = profile_json["email"]
-        if profile_json.get("phone"):
-            current_user.phone = profile_json["phone"]
-        if profile_json.get("location"):
-            current_user.location = profile_json["location"]
-        if profile_json.get("skills"):
-            current_user.skills = profile_json["skills"]
-        if profile_json.get("languages"):
-            current_user.languages = profile_json["languages"]
-        if profile_json.get("work_experience"):
-            current_user.work_experience = profile_json["work_experience"]
-        if profile_json.get("education"):
-            # Validate education data before storing
-            education_data = profile_json["education"]
-            if isinstance(education_data, list):
-                # Filter out entries without required fields
-                valid_education = []
-                for edu in education_data:
-                    if isinstance(edu, dict) and edu.get("school"):
-                        # Ensure degree field exists, use school name as fallback
-                        if not edu.get("degree"):
-                            edu["degree"] = "Education at " + edu["school"]
-                        valid_education.append(edu)
-                current_user.education = valid_education
-            else:
-                current_user.education = education_data
-        
-        db.commit()
-        db.refresh(current_user)
-        return UserResponse.from_orm(current_user)
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] Extracted text length: {len(resume_text)} characters")
+            print(f"[DEBUG] First 200 characters: {resume_text[:200]}...")
         
     except Exception as e:
-        import traceback
-        print(f"[DEBUG] Exception while loading or running Llama: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] Error extracting text: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from file: {str(e)}")
+    finally:
+        try:
+            os.remove(tmp_path)
+            print(f"[DEBUG] Temporary file removed: {tmp_path}")
+        except Exception:
+            pass
+    
+    # Check if current_user is valid
+    if not current_user:
+        raise HTTPException(status_code=401, detail="User authentication failed. Please log in again.")
+    
+    if not hasattr(current_user, 'id') or current_user.id is None:
+        raise HTTPException(status_code=401, detail="Invalid user session. Please log in again.")
+    
+    # Extract resume email for comparison and logging
+    resume_email = None
+    
+    if config.DEBUG_LLM:
+        print(f"[DEBUG] Using Ollama for single-call extraction...")
+        print(f"[DEBUG] Resume text length: {len(resume_text)} characters")
+    
+    # Create a comprehensive prompt for Ollama
+    prompt = f"""
+You are an expert data extraction agent. Your task is to extract structured information from the provided resume and return a **strictly valid JSON** object matching the schema defined below. All keys must always be present, even if values are missing.
 
-@app.post("/test_pdf_parse")
+## Output Format (MUST MATCH EXACTLY):
+
+{{
+  "personal_information": {{
+    "full_name": "string",
+    "email": "string",
+    "phone": "string",
+    "image_url": "string or null",
+    "gender": "string or null",
+    "address": "string or null",
+    "city": "string or null",
+    "state": "string or null",
+    "zip_code": "string or null",
+    "country": "string or null",
+    "citizenship": "string or null"
+  }},
+  "work_experience": [
+    {{
+      "title": "string",
+      "company": "string",
+      "location": "string",
+      "start_date": "string (YYYY-MM or similar)",
+      "end_date": "string or null (use null if current)",
+      "description": "string"
+    }}
+  ],
+  "education": [
+    {{
+      "degree": "string",
+      "school": "string (institution name)",
+      "start_date": "string (YYYY-MM or similar)",
+      "end_date": "string (YYYY-MM or similar) or null if current",
+      "gpa": "string or null"
+    }}
+  ],
+  "skills": [
+    {{
+      "name": "string",
+      "years": "integer or null"
+    }}
+  ],
+  "languages": ["string", "string", "..."],
+  "job_preferences": {{
+    "linkedin": "string",
+    "twitter": "string",
+    "github": "string",
+    "portfolio": "string",
+    "other_url": "string",
+    "notice_period": "string",
+    "total_experience": "string",
+    "default_experience": "string",
+    "highest_education": "string",
+    "companies_to_exclude": "string",
+    "willing_to_relocate": "string",
+    "driving_license": "string",
+    "visa_requirement": "string",
+    "race_ethnicity": "string"
+  }},
+  "achievements": [
+    {{
+      "title": "string",
+      "issuer": "string or null",
+      "date": "string or null",
+      "description": "string or null"
+    }}
+  ],
+  "certificates": [
+    {{
+      "name": "string",
+      "organization": "string or null",
+      "issue_date": "string or null",
+      "expiry_date": "string or null",
+      "credential_id": "string or null",
+      "credential_url": "string or null"
+    }}
+  ]
+}}
+
+## IMPORTANT RULES:
+- Return **only valid JSON**, no additional explanation or text.
+- All fields in `job_preferences` must be **strings**. If a value is numeric, boolean, or a list, convert it to a string. If missing, return an empty string.
+- Dates should be in a consistent format (e.g., `YYYY-MM`). If not available, return `null`.
+- If a field is not mentioned in the resume, fill it with `null`, `""`, or an empty list `[]`, depending on the data type.
+- `skills`, `achievements`, and `certificates` must be returned as structured objects — **not strings**.
+- Assume any structured info (e.g., LinkedIn URLs, GitHub, salary info, visa, notice period) might appear anywhere in the resume — including footers, headers, or sidebars.
+- If the job description is in bullet points, concatenate all bullet points into a single string, separated by newlines. Include all bullet points and narrative text under that job as the description. Do not omit any bullet points, even if there are many.
+
+Example for a work experience:
+
+Software Engineer, Acme Corp
+Jan 2020 – Present
+• Built X
+• Improved Y
+• Led Z
+
+Output:
+{{
+  "work_experience": [
+    {{
+      "title": "Software Engineer",
+      "company": "Acme Corp",
+      "start_date": "2020-01",
+      "end_date": "",
+      "description": "• Built X\\n• Improved Y\\n• Led Z"
+    }}
+  ]
+}}
+
+Now extract the structured data from the following resume:
+{resume_text}
+
+Return only the JSON.
+"""
+    
+    if config.DEBUG_LLM:
+        print(f"\n[DEBUG] ========================================")
+        print(f"[DEBUG] SINGLE CALL WITH OLLAMA")
+        print(f"[DEBUG] ========================================")
+        print(f"[DEBUG] Prompt length: {len(prompt)} characters")
+        print(f"[DEBUG] Starting LLM generation...")
+    
+    # Instead, define a helper to call Ollama
+    def call_ollama(prompt, model="llama3"):
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0
+            }
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+
+    try:
+        # Call Ollama with comprehensive prompt
+        output = call_ollama(prompt)
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] Raw output length: {len(output)} characters")
+            print(f"[DEBUG] Raw output: {output}")
+        # Extract the JSON object from the output, even if extra text is present
+        start = output.find('{')
+        end = output.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            json_str = output[start:end+1]
+        else:
+            json_str = output  # fallback
+        cleaned_output = json_str.strip()
+        # Remove Markdown code blocks
+        cleaned_output = re.sub(r'```json\s*', '', cleaned_output, flags=re.IGNORECASE)
+        cleaned_output = re.sub(r'```\s*', '', cleaned_output)
+        cleaned_output = re.sub(r'^\s*```\s*$', '', cleaned_output, flags=re.MULTILINE)
+        # Remove comments and trailing commas
+        cleaned_output = re.sub(r'^\s*//.*$', '', cleaned_output, flags=re.MULTILINE)
+        cleaned_output = re.sub(r',\s*([}\]])', r'\1', cleaned_output)
+        # Try to parse the JSON
+        try:
+            profile_json = pyjson.loads(cleaned_output)
+            if config.DEBUG_LLM:
+                print(f"[DEBUG] JSON parsed successfully!")
+                print(f"[DEBUG] Profile keys: {list(profile_json.keys())}")
+            
+            # Extract personal information from the new structure
+            if "personal_information" in profile_json:
+                personal_info = profile_json["personal_information"]
+                # Flatten personal information for database compatibility
+                profile_json.update({
+                    "full_name": personal_info.get("full_name", ""),
+                    "email": personal_info.get("email", ""),
+                    "phone": personal_info.get("phone", ""),
+                    "image_url": personal_info.get("image_url"),
+                    "gender": personal_info.get("gender"),
+                    "address": personal_info.get("address"),
+                    "city": personal_info.get("city"),
+                    "state": personal_info.get("state"),
+                    "zip_code": personal_info.get("zip_code"),
+                    "country": personal_info.get("country"),
+                    "citizenship": personal_info.get("citizenship")
+                })
+                # Remove the personal_information wrapper to avoid confusion
+                del profile_json["personal_information"]
+                
+        except Exception as e:
+            if config.DEBUG_LLM:
+                print(f"[DEBUG] JSON parsing failed: {e}")
+                print(f"[DEBUG] Cleaned output: {cleaned_output}")
+            # Fallback to empty profile
+            profile_json = {
+                "full_name": "",
+                "email": "",
+                "phone": "",
+                "image_url": None,
+                "gender": None,
+                "work_experience": [],
+                "education": [],
+                "skills": [],
+                "languages": [],
+                "job_preferences": {},
+                "achievements": [],
+                "certificates": []
+            }
+
+        # --- PATCH OLLAMA OUTPUT TO MATCH SCHEMA ---
+        def ensure_list_of_dicts(val):
+            if isinstance(val, list):
+                # If it's a list of strings, convert to list of dicts
+                if all(isinstance(x, str) for x in val):
+                    return [{"name": x, "years": None} for x in val]
+                if all(isinstance(x, dict) for x in val):
+                    # Clean up skills years field - convert strings like "6+" to integers
+                    cleaned_skills = []
+                    for skill in val:
+                        cleaned_skill = skill.copy()
+                        if 'years' in cleaned_skill:
+                            years_val = cleaned_skill['years']
+                            if isinstance(years_val, str):
+                                # Extract number from strings like "6+", "4+ years", etc.
+                                import re
+                                match = re.search(r'(\d+)', years_val)
+                                if match:
+                                    cleaned_skill['years'] = int(match.group(1))
+                                else:
+                                    cleaned_skill['years'] = None
+                            elif years_val is None:
+                                cleaned_skill['years'] = None
+                            else:
+                                # Try to convert to int, fallback to None
+                                try:
+                                    cleaned_skill['years'] = int(years_val)
+                                except (ValueError, TypeError):
+                                    cleaned_skill['years'] = None
+                        cleaned_skills.append(cleaned_skill)
+                    return cleaned_skills
+            if isinstance(val, str):
+                items = [x.strip() for x in val.split(",") if x.strip()]
+                return [{"name": x, "years": None} for x in items]
+            return []
+
+        def ensure_list_of_objs(val, keys):
+            if isinstance(val, list):
+                if all(isinstance(x, dict) for x in val):
+                    # Clean up work experience fields - ensure no None values for required fields
+                    cleaned_items = []
+                    for item in val:
+                        cleaned_item = {}
+                        for key in keys:
+                            value = item.get(key)
+                            if value is None:
+                                cleaned_item[key] = ""  # Convert None to empty string
+                            else:
+                                cleaned_item[key] = str(value)  # Ensure it's a string
+                        cleaned_items.append(cleaned_item)
+                    return cleaned_items
+                if all(isinstance(x, str) for x in val):
+                    return [{keys[0]: x} for x in val]
+            if isinstance(val, str):
+                items = [x.strip() for x in val.split(",") if x.strip()]
+                return [{keys[0]: x} for x in items]
+            return []
+
+        def fix_languages(val):
+            if isinstance(val, list):
+                # If it's a list of dicts with 'name', extract the names
+                if all(isinstance(x, dict) and 'name' in x for x in val):
+                    return [x['name'] for x in val]
+                if all(isinstance(x, str) for x in val):
+                    return val
+            if isinstance(val, str):
+                return [val]
+            return []
+
+        profile_json["skills"] = ensure_list_of_dicts(profile_json.get("skills", []))
+        profile_json["achievements"] = ensure_list_of_objs(profile_json.get("achievements", []), ["title"])
+        profile_json["certificates"] = ensure_list_of_objs(profile_json.get("certificates", []), ["name"])
+        profile_json["languages"] = fix_languages(profile_json.get("languages", []))
+        
+        # Clean up work experience specifically
+        if "work_experience" in profile_json:
+            work_exp = profile_json["work_experience"]
+            if isinstance(work_exp, list):
+                cleaned_work_exp = []
+                for exp in work_exp:
+                    if isinstance(exp, dict):
+                        # Ignore work experience entries without a company value
+                        if not exp.get("company"):
+                            continue
+                        cleaned_exp = {}
+                        for field in ["title", "company", "location", "start_date", "end_date", "description"]:
+                            value = exp.get(field)
+                            if value is None:
+                                cleaned_exp[field] = ""  # Convert None to empty string
+                            else:
+                                cleaned_exp[field] = str(value)  # Ensure it's a string
+                        cleaned_work_exp.append(cleaned_exp)
+                profile_json["work_experience"] = cleaned_work_exp
+        # --- END PATCH ---
+
+        # Extract resume email
+        if "email" in profile_json:
+            resume_email = profile_json["email"]
+    except Exception as e:
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] LLM call failed: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
+    
+    if config.DEBUG_LLM:
+        print(f"[DEBUG] Final profile contains:")
+        print(f"[DEBUG] - Work experiences: {len(profile_json.get('work_experience', []))}")
+        print(f"[DEBUG] - Education entries: {len(profile_json.get('education', []))}")
+        print(f"[DEBUG] - Skills: {len(profile_json.get('skills', []))}")
+        print(f"[DEBUG] - Languages: {len(profile_json.get('languages', []))}")
+    
+    # Ensure all required fields exist
+    required_fields = [
+        "full_name", "email", "phone", "image_url", "gender", "work_experience", 
+        "education", "skills", "languages", "job_preferences", "achievements", "certificates"
+    ]
+    
+    for field in required_fields:
+        if field not in profile_json:
+            if field in ["work_experience", "education", "skills", "languages", "achievements", "certificates"]:
+                profile_json[field] = []
+            elif field == "job_preferences":
+                profile_json[field] = {}
+            else:
+                profile_json[field] = None
+    
+    try:
+        # Always create a new Profile for each upload
+        from fastapi.encoders import jsonable_encoder
+        from schemas import ProfileCreate
+        # Prepare the profile data
+        profile_data = {
+            'title': title or "Resume Profile",
+            'full_name': profile_json.get('full_name', None),
+            'email': profile_json.get('email', None),
+            'phone': profile_json.get('phone', None),
+            'image_url': profile_json.get('image_url', None),
+            'address': profile_json.get('address', None),
+            'city': profile_json.get('city', None),
+            'state': profile_json.get('state', None),
+            'zip_code': profile_json.get('zip_code', None),
+            'country': profile_json.get('country', None),
+            'citizenship': profile_json.get('citizenship', None),
+            'gender': profile_json.get('gender', None),
+            'skills': profile_json.get('skills', []),
+            'languages': profile_json.get('languages', []),
+            'work_experience': profile_json.get('work_experience', []),
+            'education': profile_json.get('education', []),
+            'job_preferences': profile_json.get('job_preferences', {}),
+            'achievements': profile_json.get('achievements', []),
+            'certificates': profile_json.get('certificates', []),
+        }
+        # Use the ProfileCreate schema for validation
+        profile_create = ProfileCreate(**profile_data)
+        # Call the create_profile endpoint logic directly
+        from fastapi import Request
+        new_profile = create_profile(profile_create, current_user=current_user, db=db)
+        db.commit()
+        db.refresh(new_profile)
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] New profile created with ID: {new_profile.id}")
+        # Return the created profile data
+        return ProfileResponse(
+            id=new_profile.id,
+            user_id=current_user.id,
+            title=new_profile.title,
+            full_name=new_profile.full_name,
+            email=new_profile.email,
+            phone=new_profile.phone,
+            image_url=new_profile.image_url,
+            address=new_profile.address,
+            city=new_profile.city,
+            state=new_profile.state,
+            zip_code=new_profile.zip_code,
+            country=new_profile.country,
+            citizenship=new_profile.citizenship,
+            gender=new_profile.gender,
+            skills=new_profile.skills,
+            languages=new_profile.languages,
+            work_experience=new_profile.work_experience,
+            education=new_profile.education,
+            job_preferences=new_profile.job_preferences,
+            achievements=new_profile.achievements,
+            certificates=new_profile.certificates,
+            created_at=new_profile.created_at,
+            updated_at=new_profile.updated_at
+        )
+    except Exception as e:
+        db.rollback()
+        if config.DEBUG_LLM:
+            print(f"[DEBUG] Error saving profile: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save profile: {str(e)}")
+
+class DeleteResponse(BaseModel):
+    message: str
+
+class TestPdfResponse(BaseModel):
+    text: str
+
+@app.post("/test_pdf_parse", response_model=TestPdfResponse)
 def test_pdf_parse(file: UploadFile = File(...)):
     """Test endpoint to extract and return text from a PDF file."""
     if not file.filename or not file.filename.lower().endswith('.pdf'):
@@ -958,7 +1195,7 @@ def test_pdf_parse(file: UploadFile = File(...)):
         text = extract_pdf_text(tmp_path)
     finally:
         os.remove(tmp_path)
-    return {"text": text[:1000]}  # Return first 1000 chars for preview
+    return TestPdfResponse(text=text[:1000])  # Return first 1000 chars for preview
 
 LOGOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
 app.mount("/logos", StaticFiles(directory=LOGOS_DIR), name="logos")
@@ -1106,4 +1343,92 @@ def update_application_status(session_id: str, job_id: int, status: str):
         
         return {"message": "Status updated successfully"}
     finally:
-        db.close() 
+        db.close()
+
+@app.middleware("http")
+async def log_cors_headers(request: Request, call_next):
+    origin = request.headers.get("origin")
+    print(f"[CORS DEBUG] Incoming request from Origin: {origin}")
+    response = await call_next(request)
+    print(f"[CORS DEBUG] Response headers: {dict(response.headers)}")
+    return response 
+
+@app.get("/profiles", response_model=List[ProfileResponse])
+def list_profiles(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    profiles = db.query(Profile).filter(Profile.user_id == current_user.id).all()
+    return profiles
+
+@app.get("/profiles/{profile_id}", response_model=ProfileResponse)
+def get_profile_by_id(profile_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    profile = db.query(Profile).filter(Profile.id == profile_id, Profile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+@app.post("/profiles", response_model=ProfileResponse)
+def create_profile(profile: ProfileCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    print("[DEBUG] /profiles POST called by user:", current_user.email if current_user else None)
+    print("[DEBUG] Incoming profile data:", profile.dict())
+    try:
+        profile_data = profile.dict(exclude_unset=True, exclude={"id", "created_at", "updated_at"})
+        new_profile = Profile(user_id=current_user.id, **profile_data)
+        db.add(new_profile)
+        db.commit()
+        db.refresh(new_profile)
+        print("[DEBUG] Profile saved successfully, id:", new_profile.id)
+        return new_profile
+    except Exception as e:
+        import traceback
+        print(f"[DEBUG] Exception in /profiles POST: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Profile save failed: {str(e)}")
+
+@app.put("/profiles/{profile_id}", response_model=ProfileResponse)
+def update_profile_by_id(profile_id: int, update: dict, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    print(f"[DEBUG] Updating profile {profile_id} with data: {update}")
+    profile = db.query(Profile).filter(Profile.id == profile_id, Profile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    
+    try:
+        # Handle partial updates by updating only the fields that are provided
+        for field, value in update.items():
+            if hasattr(profile, field):
+                # Handle special cases for nested objects
+                if field == "job_preferences" and value is not None:
+                    # Update job_preferences as a JSON object
+                    if isinstance(value, dict):
+                        setattr(profile, field, value)
+                    else:
+                        print(f"[DEBUG] Invalid job_preferences format: {type(value)}")
+                elif field in ["skills", "languages", "work_experience", "education", "achievements", "certificates"]:
+                    # Handle list fields
+                    if value is not None:
+                        setattr(profile, field, value)
+                else:
+                    # Handle simple fields
+                    setattr(profile, field, value)
+            else:
+                print(f"[DEBUG] Field {field} not found in Profile model")
+        
+        db.commit()
+        db.refresh(profile)
+        print(f"[DEBUG] Profile {profile_id} updated successfully")
+        return profile
+    except Exception as e:
+        print(f"[DEBUG] Error updating profile: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")
+
+@app.delete("/profiles/{profile_id}", response_model=DeleteResponse)
+def delete_profile(profile_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    profile = db.query(Profile).filter(Profile.id == profile_id, Profile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    db.delete(profile)
+    db.commit()
+    return DeleteResponse(message="Profile deleted")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000) 

@@ -1,62 +1,52 @@
 import sqlite3
+import os
 
 def check_database():
-    conn = sqlite3.connect('job_automation.db')
-    cursor = conn.cursor()
+    db_path = "job_automation.db"
     
-    # Get total jobs
-    cursor.execute('SELECT COUNT(*) FROM jobs')
-    total_jobs = cursor.fetchone()[0]
-    print(f'Total jobs: {total_jobs}')
+    if not os.path.exists(db_path):
+        print(f"Database file {db_path} does not exist!")
+        return
     
-    # Get distinct sources
-    cursor.execute('SELECT DISTINCT source FROM jobs WHERE source IS NOT NULL')
-    sources = cursor.fetchall()
-    print(f'Sources: {[s[0] for s in sources]}')
+    print(f"Database file {db_path} exists!")
     
-    # Get Greenhouse jobs count
-    cursor.execute('SELECT COUNT(*) FROM jobs WHERE source = "Greenhouse"')
-    greenhouse_count = cursor.fetchone()[0]
-    print(f'Greenhouse jobs: {greenhouse_count}')
-    
-    # Show some sample Greenhouse jobs
-    if greenhouse_count > 0:
-        cursor.execute('SELECT title, company, location FROM jobs WHERE source = "Greenhouse" LIMIT 5')
-        sample_jobs = cursor.fetchall()
-        print('\nSample Greenhouse jobs:')
-        for i, job in enumerate(sample_jobs, 1):
-            print(f'{i}. {job[0]} - {job[1]} - {job[2]}')
-
-    # Get Lever jobs count
-    cursor.execute('SELECT COUNT(*) FROM jobs WHERE source = "Lever"')
-    lever_count = cursor.fetchone()[0]
-    print(f'Lever jobs: {lever_count}')
-
-    # Show some sample Lever jobs with description
-    if lever_count > 0:
-        cursor.execute('SELECT title, company, location, description FROM jobs WHERE source = "Lever" LIMIT 5')
-        sample_lever_jobs = cursor.fetchall()
-        print('\nSample Lever jobs:')
-        for i, job in enumerate(sample_lever_jobs, 1):
-            desc = job[3] if job[3] else 'No description'
-            print(f'{i}. {job[0]} - {job[1]} - {job[2]}')
-            print(f'   Description: {desc[:200]}...')
-    
-    # Check if any Lever job has a non-empty, non-null description
-    cursor.execute('SELECT COUNT(*) FROM jobs WHERE source = "Lever" AND description IS NOT NULL AND description != ""')
-    lever_with_desc_count = cursor.fetchone()[0]
-    if lever_with_desc_count > 0:
-        print(f'Lever jobs with non-empty description: {lever_with_desc_count}')
-        cursor.execute('SELECT title, company, location, description FROM jobs WHERE source = "Lever" AND description IS NOT NULL AND description != "" LIMIT 3')
-        sample_lever_with_desc = cursor.fetchall()
-        print('\nSample Lever jobs with description:')
-        for i, job in enumerate(sample_lever_with_desc, 1):
-            print(f'{i}. {job[0]} - {job[1]} - {job[2]}')
-            print(f'   Description: {job[3][:200]}...')
-    else:
-        print('No Lever jobs with non-empty description found.')
-    
-    conn.close()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Check what tables exist
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = cursor.fetchall()
+        print(f"Tables in database: {tables}")
+        
+        # Check jobs table structure if it exists
+        if ('jobs',) in tables:
+            cursor.execute("PRAGMA table_info(jobs)")
+            columns = cursor.fetchall()
+            print("\nJobs table columns:")
+            for col in columns:
+                print(f"  {col[1]} ({col[2]})")
+        
+        # Check users table structure if it exists
+        if ('users',) in tables:
+            cursor.execute("PRAGMA table_info(users)")
+            columns = cursor.fetchall()
+            print("\nUsers table columns:")
+            for col in columns:
+                print(f"  {col[1]} ({col[2]})")
+        
+        # Check profiles table structure if it exists
+        if ('profiles',) in tables:
+            cursor.execute("PRAGMA table_info(profiles)")
+            columns = cursor.fetchall()
+            print("\nProfiles table columns:")
+            for col in columns:
+                print(f"  {col[1]} ({col[2]})")
+        
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error checking database: {e}")
 
 if __name__ == "__main__":
     check_database() 
